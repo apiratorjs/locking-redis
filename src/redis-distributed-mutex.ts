@@ -2,15 +2,24 @@ import { types } from "@apiratorjs/locking";
 import { RedisClientType } from "redis";
 import assert from "node:assert";
 import crypto from "node:crypto";
+import { DEFAULT_TTL_MS } from "./constants";
+import { IDistributedDeferred } from "./types";
+import { IReleaser } from "@apiratorjs/locking/dist/src/types";
 
-interface Deferred {
-  resolve: () => void;
-  reject: (reason?: any) => void;
-  ttlMs: number;
-  timer?: NodeJS.Timeout | null;
+class Releaser implements IReleaser {
+  constructor(
+    private readonly _onRelease: () => Promise<void>,
+    private readonly _token: types.AcquireToken
+  ) {}
+
+  public async release(): Promise<void> {
+    await this._onRelease();
+  }
+
+  public getToken(): types.AcquireToken {
+    return this._token;
+  }
 }
-
-const DEFAULT_TTL_MS = 1000 * 60; // 1 minute
 
 export class RedisDistributedMutex implements types.IDistributedMutex {
   public readonly name: string;
@@ -18,13 +27,13 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
 
   private readonly _redisClient: RedisClientType;
   private _redisSubscriber?: RedisClientType;
-  private _queue: Deferred[];
+  private _queue: IDistributedDeferred[];
   private _isDestroyed: boolean = false;
   /**
    * Holds the random lock token if we successfully acquire it.
    * Using a random token helps ensure that only the owner can release.
    */
-  private _lockValue?: string;
+  private _lockValue?: types.AcquireToken;
 
   public constructor(props: types.DistributedMutexConstructorProps & {
     redisClient: RedisClientType;
@@ -72,25 +81,29 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
     }
   }
 
-  public async acquire(params?: types.AcquireParams): Promise<void> {
+  public async acquire(params?: types.AcquireParams): Promise<IReleaser> {
     this.throwIfDestroyed();
 
     await this.ensureSubscriber();
 
     const { timeoutMs = DEFAULT_TTL_MS } = params ?? {};
 
-    const acquired = await this.tryAcquire(timeoutMs);
-    if (acquired) {
-      return;
+    const token = `${this.name}:${crypto.randomUUID()}`;
+    const releaser = new Releaser(this.release.bind(this), token);
+
+    const wasAcquired = await this.tryAcquire(timeoutMs, releaser);
+    if (wasAcquired) {
+      return releaser;
     }
 
     // Return a promise that resolves once the lock is eventually acquired.
     return new Promise((resolve, reject) => {
-      const deferred: Deferred = {
-        resolve,
+      const deferred: IDistributedDeferred = {
+        resolve: () => resolve(releaser!),
         reject,
         ttlMs: timeoutMs,
-        timer: null
+        timer: null,
+        releaser
       };
 
       deferred.timer = setTimeout(() => {
@@ -104,28 +117,6 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
 
       this._queue.push(deferred);
     });
-  }
-
-  public async release(): Promise<void> {
-    this.throwIfDestroyed();
-
-    // Only release if the lock key’s value matches our lockValue
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      end
-      return 0
-    `;
-    const result = await this._redisClient.eval(script, {
-      keys: [this.name],
-      arguments: [this._lockValue ?? ""]
-    });
-
-    // If we successfully released, let the next queue item know they can try
-    if (result === 1) {
-      await this._redisClient.publish(`${this.name}:release`, "released");
-      this._lockValue = undefined;
-    }
   }
 
   public async cancel(errMessage?: string): Promise<void> {
@@ -155,35 +146,28 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
       throw new Error("Invalid arguments for runExclusive");
     }
 
-    await this.acquire(params);
+    const releaser = await this.acquire(params);
     try {
       return await fn();
     } finally {
-      await this.release();
+      await releaser.release();
     }
   }
 
-  private async tryAcquire(ttlMs: number): Promise<boolean> {
-    const token = crypto.randomBytes(16).toString("hex");
-
-    const result = await this._redisClient.set(this.name, token, {
+  private async tryAcquire(ttlMs: number, releaser: IReleaser): Promise<boolean> {
+    const result = await this._redisClient.set(this.name, releaser.getToken(), {
       NX: true,
       PX: ttlMs
     });
 
     if (result === "OK") {
-      this._lockValue = token;
+      this._lockValue = releaser.getToken();
       return true;
     }
 
     return false;
   }
 
-  /**
-   * Ensure we have a single subscriber that listens to both `cancel` and `release`.
-   * - on `cancel`, we reject all waiters.
-   * - on `release`, let the first in queue attempt reacquiring the lock.
-   */
   private async ensureSubscriber(): Promise<void> {
     if (this._redisSubscriber) {
       return;
@@ -214,8 +198,8 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
     await this._redisSubscriber.subscribe(`${this.name}:release`, async () => {
       while (this._queue.length > 0) {
         const nextInQueue = this._queue[0];
-        const gotLock = await this.tryAcquire(nextInQueue.ttlMs);
-        if (!gotLock) {
+        const wasAcquired = await this.tryAcquire(nextInQueue.ttlMs, nextInQueue.releaser);
+        if (!wasAcquired) {
           break;
         }
 
@@ -238,6 +222,28 @@ export class RedisDistributedMutex implements types.IDistributedMutex {
   private throwIfDestroyed(): void {
     if (this._isDestroyed) {
       throw new Error("Mutex has been destroyed");
+    }
+  }
+
+  private async release(): Promise<void> {
+    this.throwIfDestroyed();
+
+    // Only release if the lock key’s value matches our lockValue
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      end
+      return 0
+    `;
+    const result = await this._redisClient.eval(script, {
+      keys: [this.name],
+      arguments: [this._lockValue ?? ""]
+    });
+
+    // If we successfully released, let the next queue item know they can try
+    if (result === 1) {
+      await this._redisClient.publish(`${this.name}:release`, "released");
+      this._lockValue = undefined;
     }
   }
 }
