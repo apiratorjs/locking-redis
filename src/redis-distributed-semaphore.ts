@@ -1,46 +1,25 @@
-import { AcquireParams, IDistributedSemaphore } from "@apiratorjs/locking/dist/src/types";
+import { AcquireParams, IDistributedSemaphore, IReleaser } from "@apiratorjs/locking/dist/src/types";
 import assert from "node:assert";
 import { RedisClientType } from "redis";
 import { IDistributedDeferred } from "./types";
 import { types } from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
 import crypto from "node:crypto";
+import { DistributedReleaser } from "./distributed-releaser";
+import { BaseDistributedPrimitive } from "./base-distributed-primitive";
 
-export class RedisDistributedSemaphore implements IDistributedSemaphore {
-  public readonly name: string;
-  public readonly implementation: string = "redis";
+export class RedisDistributedSemaphore extends BaseDistributedPrimitive implements IDistributedSemaphore {
   public readonly maxCount: number;
-
-  private readonly _redisClient: RedisClientType;
-  private _redisSubscriber?: RedisClientType;
-  private _queue: IDistributedDeferred[];
-  private _isDestroyed: boolean = false;
-
-  /**
-   * We store each active token in a set named `<name>:owners`,
-   * and each token's TTL is enforced by a key named `<name>:token:<uuid>`.
-   */
-  private readonly _ownersKey: string;       // e.g. "mySemaphore:owners"
-  private readonly _tokenKeyPrefix: string;  // e.g. "mySemaphore:token:"
 
   public constructor(props: types.DistributedSemaphoreConstructorProps & {
     redisClient: RedisClientType;
   }) {
-    const { maxCount, name, redisClient } = props;
+    super({ ...props, name: `semaphore:${props.name}` });
+    const { maxCount } = props;
     assert.ok(maxCount > 0, "maxCount must be greater than 0");
-    assert.ok(name, "name must be provided");
 
     this.maxCount = maxCount;
-    this.name = `semaphore:${name}`;
-    this._redisClient = redisClient;
-    this._queue = [];
-    this._ownersKey = `${name}:owners`;
-    this._tokenKeyPrefix = `${name}:token:`;
   }
-
-  public get isDestroyed(): boolean {
-    return this._isDestroyed;
-  };
 
   public async destroy(): Promise<void> {
     if (this._isDestroyed) {
@@ -74,27 +53,27 @@ export class RedisDistributedSemaphore implements IDistributedSemaphore {
   }
 
   public async freeCount(): Promise<number> {
-    const currentStr = await this._redisClient.get(this.name);
-    const current = currentStr ? Number(currentStr) : 0;
-    return this.maxCount - current;
+    await this._redisClient.zRemRangeByScore(this.name, "-inf", Date.now());
+    const currentCount = await this._redisClient.zCard(this.name);
+    return this.maxCount - currentCount;
   }
 
-  public async acquire(params?: AcquireParams): Promise<types.AcquiredDistributedToken> {
+  public async acquire(params?: AcquireParams): Promise<IReleaser> {
     this.throwIfDestroyed();
 
     await this.ensureSubscriber();
 
     const { timeoutMs = DEFAULT_TTL_MS } = params ?? {};
 
-    const acquiredToken = await this.tryAcquire(timeoutMs);
-    if (acquiredToken) {
-      return acquiredToken;
+    const acquireToken = await this.tryAcquire(timeoutMs);
+    if (acquireToken) {
+      return new DistributedReleaser(() => this.release(acquireToken), acquireToken);
     }
 
     // Return a promise that resolves once the lock is eventually acquired.
     return new Promise((resolve, reject) => {
       const deferred: IDistributedDeferred = {
-        resolve: () => resolve(acquiredToken as string),
+        resolve,
         reject,
         ttlMs: timeoutMs,
         timer: null
@@ -113,33 +92,23 @@ export class RedisDistributedSemaphore implements IDistributedSemaphore {
     });
   }
 
-  public async release(token: types.AcquiredDistributedToken): Promise<void> {
+  protected async release(token: types.AcquireToken): Promise<void> {
     this.throwIfDestroyed();
 
     const RELEASE_LUA = `
-      local removed = redis.call("SREM", KEYS[1], ARGV[1])
-      if removed == 1 then
-        local tokenKey = ARGV[2] .. ARGV[1]
-        redis.call("DEL", tokenKey)
-        return 1
-      else
-        return 0
-      end
+      local removed = redis.call('zrem', KEYS[1], ARGV[1])
+      return removed
     `;
 
-    const result = await this._redisClient.eval(RELEASE_LUA, {
-      keys: [this._ownersKey],
-      arguments: [
-        token,
-        this._tokenKeyPrefix
-      ]
+    const removed = await this._redisClient.eval(RELEASE_LUA, {
+      keys: [this.name],
+      arguments: [token]
     });
 
-    if (result !== 1) {
-      return;
+    // Only publish release message if a token was actually removed
+    if (removed === 1) {
+      await this._redisClient.publish(`${this.name}:release`, token);
     }
-
-    await this._redisClient.publish(`${this.name}:release`, "release");
   }
 
   public async cancelAll(errMessage?: string): Promise<void> {
@@ -169,97 +138,46 @@ export class RedisDistributedSemaphore implements IDistributedSemaphore {
       throw new Error("Invalid arguments for runExclusive");
     }
 
-    const acquiredToken = await this.acquire(params);
+    const releaser = await this.acquire(params);
     try {
       return await fn();
     } finally {
-      await this.release(acquiredToken);
+      await this.release(releaser.getToken());
     }
   }
 
-  private async ensureSubscriber(): Promise<void> {
-    if (this._redisSubscriber) {
-      return;
-    }
-
-    this._redisSubscriber = this._redisClient.duplicate();
-    await this._redisSubscriber.connect();
-
-    await this._redisSubscriber.subscribe(`${this.name}:cancel`, (message) => {
-      if (!message.startsWith("cancel")) {
-        return;
-      }
-
-      const errMessage: string | undefined = message.split(":")[1];
-
-      while (this._queue.length > 0) {
-        const deferred = this._queue.shift()!;
-
-        if (deferred.timer) {
-          clearTimeout(deferred.timer);
-          deferred.timer = null;
-        }
-
-        deferred.reject(new Error(errMessage || "Mutex cancelled"));
-      }
-    });
-
-    await this._redisSubscriber.subscribe(`${this.name}:release`, async () => {
-      while (this._queue.length > 0) {
-        const nextInQueue = this._queue[0];
-        const acquiredToken = await this.tryAcquire(nextInQueue.ttlMs);
-        if (!acquiredToken) {
-          break;
-        }
-
-        this._queue.shift();
-
-        if (nextInQueue.timer) {
-          clearTimeout(nextInQueue.timer);
-          nextInQueue.timer = null;
-        }
-
-        nextInQueue.resolve(acquiredToken);
-      }
-    });
-
-    await this._redisSubscriber.subscribe(`${this.name}:destroy`, async () => {
-      await this.destroy();
-    });
-  }
-
-  private async tryAcquire(ttlMs: number): Promise<types.AcquiredDistributedToken | undefined> {
-    // Use a Lua script to do it atomically:
-    //  1. SCARD ownersKey to see how many tokens exist
-    //  2. If < maxCount, add new token to set, SET the tokenKey with TTL
-    //  3. Return 1 or 0 to indicate success/failure
+  protected async tryAcquire(ttlMs: number): Promise<types.AcquireToken | undefined> {
     const ACQUIRE_LUA = `
-      local currentCount = redis.call("SCARD", KEYS[1])
-      local maxCount = tonumber(ARGV[1])
-      local token = ARGV[2]
-      local tokenKey = ARGV[3] .. token
-      local ttlMs = tonumber(ARGV[4])
-
-      if currentCount < maxCount then
-        -- Add the token to the set
-        redis.call("SADD", KEYS[1], token)
-        -- Create a separate key with a TTL
-        redis.call("SET", tokenKey, "1", "PX", ttlMs)
-        return 1
-      else
-        return 0
+      -- Remove expired locks
+      redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
+      
+      -- Check if there are free slots and add the lock in one atomic operation
+      local currentCount = redis.call('zcard', KEYS[1])
+      if currentCount < tonumber(ARGV[2]) then
+          redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
+          
+          -- Set the key to expire if it is not already set to expire sooner
+          local keyTtl = redis.call('pttl', KEYS[1])
+            if keyTtl < tonumber(ARGV[5]) then
+                redis.call('pexpire', KEYS[1], ARGV[5])
+            end
+          return 1
       end
+      return 0
     `;
 
-    const token = `${this.name}:${crypto.randomUUID()}`;
+    const token = `${this.name}:${crypto.randomUUID()}` as types.AcquireToken;
+    const now = Date.now();
+    const expiryTimestamp = now + ttlMs;
 
     const result = await this._redisClient.eval(ACQUIRE_LUA, {
-      keys: [this._ownersKey],
+      keys: [this.name],
       arguments: [
-        this.maxCount.toString(),
-        token,
-        this._tokenKeyPrefix,
-        ttlMs.toString()
+        now.toString(),                // Current time for expiry check
+        this.maxCount.toString(),      // Max count of semaphore
+        expiryTimestamp.toString(),    // Expiry timestamp for the new lock
+        token,                         // Token for the lock
+        (ttlMs * 3).toString()         // TTL for the key in Redis
       ]
     });
 

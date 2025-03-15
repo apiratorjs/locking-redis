@@ -3,7 +3,7 @@
 [![NPM version](https://img.shields.io/npm/v/@apiratorjs/locking-redis.svg)](https://www.npmjs.com/package/@apiratorjs/locking-redis)
 [![License: MIT](https://img.shields.io/npm/l/@apiratorjs/locking-redis.svg)](https://github.com/apiratorjs/locking-redis/blob/main/LICENSE)
 
-An extension to the core @apiratorjs/locking library, providing Redis-based implementations of distributed mutexes and
+An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/locking) library, providing Redis-based implementations of distributed mutexes and
 semaphores for true cross-process concurrency control in Node.js.
 
 > **Note:** Requires Node.js version **>=16.4.0**

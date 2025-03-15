@@ -38,7 +38,8 @@
   "scripts": {
     "build": "rm -rf dist && tsc",
     "watch": "tsc --watch",
-    "test": "node --test dist/test"
+    "test": "node --test dist/test",
+    "prepublishOnly": "npm run build && npm test"
   },
   "engines": {
     "node": ">=16.4.0"
