@@ -52,7 +52,7 @@ export abstract class BaseDistributedPrimitive {
           deferred.timer = null;
         }
 
-        deferred.reject(new Error(errMessage || "Mutex cancelled"));
+        deferred.reject(new Error(errMessage || "Cancelled"));
       }
     });
 
