@@ -39,13 +39,13 @@ semaphores for true cross-process concurrency control in Node.js.
 Install with npm:
 
 ```bash
-npm install redis @apiratorjs/locking @apiratorjs/locking-redis
+npm install @apiratorjs/locking @apiratorjs/locking-redis
 ```
 
 Or with yarn:
 
 ```bash
-yarn add redis @apiratorjs/locking @apiratorjs/locking-redis
+yarn add @apiratorjs/locking @apiratorjs/locking-redis
 ```
 
 ---
