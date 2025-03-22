@@ -349,4 +349,33 @@ describe("DistributedMutex", () => {
     await releaser.release();
     await mutex.destroy();
   });
+
+  it("should remove the lock and reject waiters when destroy is called while locked", async () => {
+    const mutex = new DistributedMutex({ name: DISTRIBUTED_MUTEX_NAME });
+
+    const releaser = await mutex.acquire();
+
+    const mutex2 = new DistributedMutex({ name: DISTRIBUTED_MUTEX_NAME });
+
+    let semaphore2Acquired = false;
+    const p = mutex2.acquire().then(() => {
+      semaphore2Acquired = true;
+    });
+
+    // Wait while mutex2 subscription is established
+    await sleep(50);
+
+    await mutex.destroy();
+
+    let pError: Error | undefined;
+    try {
+      await p;
+    } catch (err: any) {
+      pError = err;
+    }
+
+    assert.ok(pError, "Second mutex should be rejected");
+    assert.ok(pError!.message === "Mutex destroyed", "Error message should be 'Mutex destroyed'");
+    assert.ok(!semaphore2Acquired, "Second mutex should not be acquired");
+  });
 });

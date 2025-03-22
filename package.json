@@ -1,6 +1,6 @@
 {
   "name": "@apiratorjs/locking-redis",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "An extension to the core @apiratorjs/locking library, providing Redis-based implementations of distributed mutexes and semaphores for true cross-process concurrency control in Node.js.",
   "author": {
     "name": "Oleksii Zaitsev",
@@ -38,14 +38,14 @@
   "scripts": {
     "build": "rm -rf dist && tsc",
     "watch": "tsc --watch",
-    "test": "node --test dist/test",
-    "prepublishOnly": "npm run build && npm test"
+    "test": "npm run build && node --test dist/test",
+    "prepublishOnly": "npm run test"
   },
   "engines": {
     "node": ">=16.4.0"
   },
   "devDependencies": {
-    "@apiratorjs/locking": "^2.0.0",
+    "@apiratorjs/locking": "^3.0.2",
     "@types/node": "^22.13.1",
     "@types/redis": "^4.0.10",
     "tsx": "^4.19.2",

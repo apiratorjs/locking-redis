@@ -228,7 +228,7 @@ describe("DistributedSemaphore", () => {
     const p = semaphore2.acquire().then(() => { semaphore2Acquired = true; });
 
     // Wait while semaphore2 subscription is established
-    await sleep(200);
+    await sleep(50);
 
     await semaphore.destroy();
 
