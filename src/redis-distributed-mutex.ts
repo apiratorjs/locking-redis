@@ -1,6 +1,6 @@
 import { types } from "@apiratorjs/locking";
 import { RedisClientType } from "redis";
-import crypto from "node:crypto";
+import * as crypto from "node:crypto";
 import { DEFAULT_TTL_MS } from "./constants";
 import { IDistributedDeferred } from "./types";
 import { IReleaser } from "@apiratorjs/locking/dist/src/types";
@@ -51,7 +51,7 @@ export class RedisDistributedMutex extends BaseDistributedPrimitive implements t
     }
   }
 
-  public async acquire(params?: types.AcquireParams): Promise<IReleaser> {
+  public async acquire(params?: types.AcquireParams): Promise<IReleaser<types.MutexToken>> {
     this.throwIfDestroyed();
 
     await this.ensureSubscriber();
@@ -60,7 +60,7 @@ export class RedisDistributedMutex extends BaseDistributedPrimitive implements t
 
     const acquireToken = await this.tryAcquire(timeoutMs);
     if (acquireToken) {
-      return new DistributedReleaser(() => this.release(acquireToken), acquireToken);
+      return new DistributedReleaser<types.MutexToken>(() => this.release(acquireToken), acquireToken as types.MutexToken);
     }
 
     // Return a promise that resolves once the lock is eventually acquired.
@@ -120,6 +120,29 @@ export class RedisDistributedMutex extends BaseDistributedPrimitive implements t
     }
   }
 
+  public async waitForUnlock(): Promise<void> {
+    this.throwIfDestroyed();
+    
+    // If not currently locked, return immediately
+    const isLocked = await this.isLocked();
+    if (!isLocked) {
+      return;
+    }
+
+    // Otherwise wait for a release event
+    await this.ensureSubscriber();
+    
+    const releaseEvent = new Promise<void>((resolve) => {
+      const handler = () => {
+        this._redisSubscriber?.unsubscribe(`${this.name}:release`);
+        resolve();
+      };
+      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+    });
+
+    await releaseEvent;
+  }
+
   protected async tryAcquire(timeoutMs: number): Promise<types.AcquireToken | undefined> {
     const token = `${this.name}:${crypto.randomUUID()}` as types.AcquireToken;
 
@@ -145,7 +168,7 @@ export class RedisDistributedMutex extends BaseDistributedPrimitive implements t
   protected async release(token: types.AcquireToken): Promise<void> {
     this.throwIfDestroyed();
 
-    // Only release if the lock key’s value matches our lockValue
+    // Only release if the lock key's value matches our lockValue
     const RELEASE_LUA = `
       if redis.call("get", KEYS[1]) == ARGV[1] then
         return redis.call("del", KEYS[1])

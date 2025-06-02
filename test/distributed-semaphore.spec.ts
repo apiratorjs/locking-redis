@@ -1,7 +1,7 @@
 import { after, before, beforeEach, describe, it } from "node:test";
-import assert from "node:assert";
+import * as assert from "node:assert";
 import { createRedisLockFactory, IRedisLockFactory } from "../src";
-import { DistributedMutex, DistributedSemaphore } from "@apiratorjs/locking";
+import { DistributedSemaphore } from "@apiratorjs/locking";
 import { sleep } from "../src/utils";
 
 const DISTRIBUTED_SEMAPHORE_NAME = "shared-semaphore";
@@ -244,5 +244,77 @@ describe("DistributedSemaphore", () => {
     assert.strictEqual(semaphore2Acquired, false);
 
     await semaphore2.destroy();
+  });
+
+  it("should wait for the semaphore to be unlocked", async () => {
+    const semaphore = new DistributedSemaphore({ maxCount: 1, name: DISTRIBUTED_SEMAPHORE_NAME });
+    const releaser = await semaphore.acquire();
+
+    assert.strictEqual(await semaphore.isLocked(), true, "Semaphore should be locked");
+
+    setTimeout(async () => {
+      await releaser.release();
+    }, 200);
+
+    assert.strictEqual(await semaphore.isLocked(), true, "Semaphore should be locked");
+
+    await semaphore.waitForAnyUnlock();
+
+    assert.strictEqual(await semaphore.isLocked(), false, "Semaphore should be unlocked");
+
+    await semaphore.destroy();
+  });
+
+  it("should wait for the semaphore to be unlocked of first 3 slots of 5", async () => {
+    const semaphore = new DistributedSemaphore({ maxCount: 5, name: DISTRIBUTED_SEMAPHORE_NAME });
+    const releaser = await semaphore.acquire();
+    const releaser2 = await semaphore.acquire();
+    const releaser3 = await semaphore.acquire();
+    const releaser4 = await semaphore.acquire();
+    const releaser5 = await semaphore.acquire();
+
+    assert.strictEqual(await semaphore.isLocked(), true, "Semaphore should be locked");
+    assert.strictEqual(await semaphore.freeCount(), 0, "Semaphore should have no free slots");
+
+    setTimeout(async () => {
+      await releaser.release();
+      await releaser2.release();
+      await releaser3.release();
+    }, 100);
+
+    await semaphore.waitForAnyUnlock();
+
+    assert.strictEqual(await semaphore.freeCount(), 3, "Semaphore should have 3 slots free");
+
+    await semaphore.destroy();
+  });
+
+  it("should wait for the semaphore to be fully unlocked", async () => {
+    const semaphore = new DistributedSemaphore({ maxCount: 5, name: DISTRIBUTED_SEMAPHORE_NAME });
+    const releaser = await semaphore.acquire();
+    const releaser2 = await semaphore.acquire();
+    const releaser3 = await semaphore.acquire();
+    const releaser4 = await semaphore.acquire();
+    const releaser5 = await semaphore.acquire();
+
+    assert.strictEqual(await semaphore.isLocked(), true, "Semaphore should be locked");
+    assert.strictEqual(await semaphore.freeCount(), 0, "Semaphore should have no free slots");
+
+    setTimeout(async () => {
+      await releaser.release();
+      await releaser2.release();
+      await releaser3.release();
+    }, 100);
+
+    setTimeout(async () => {
+      await releaser4.release();
+      await releaser5.release();
+    }, 200);
+
+    await semaphore.waitForFullyUnlock();
+
+    assert.strictEqual(await semaphore.freeCount(), 5, "Semaphore should have 3 slots free");
+
+    await semaphore.destroy();
   });
 });

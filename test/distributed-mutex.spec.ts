@@ -1,5 +1,5 @@
 import { after, before, beforeEach, describe, it } from "node:test";
-import assert from "node:assert";
+import * as assert from "node:assert";
 import { sleep } from "../src/utils";
 import { DistributedMutex, types } from "@apiratorjs/locking";
 import { createRedisLockFactory, IRedisLockFactory } from "../src";
@@ -29,6 +29,7 @@ describe("DistributedMutex", () => {
     assert.strictEqual(await mutex.isLocked(), false);
 
     const releaser = await mutex.acquire();
+    await sleep(100);
     assert.strictEqual(await mutex.isLocked(), true);
 
     await releaser.release();
@@ -377,5 +378,24 @@ describe("DistributedMutex", () => {
     assert.ok(pError, "Second mutex should be rejected");
     assert.ok(pError!.message === "Mutex destroyed", "Error message should be 'Mutex destroyed'");
     assert.ok(!semaphore2Acquired, "Second mutex should not be acquired");
+  });
+
+  it("should wait for the mutex to be unlocked", async () => {
+    const mutex = new DistributedMutex({ name: DISTRIBUTED_MUTEX_NAME });
+    const releaser = await mutex.acquire();
+
+    assert.strictEqual(await mutex.isLocked(), true, "Mutex should be locked");
+
+    setTimeout(async () => {
+      await releaser.release();
+    }, 200);
+
+    assert.strictEqual(await mutex.isLocked(), true, "Mutex should be locked")
+
+    await mutex.waitForUnlock();
+
+    assert.strictEqual(await mutex.isLocked(), false, "Mutex should be unlocked");
+
+    await mutex.destroy();
   });
 });

@@ -10,7 +10,6 @@
     "sourceMap": true,
     "moduleResolution": "node",
     "allowSyntheticDefaultImports": true,
-    "esModuleInterop": true,
     "downlevelIteration": true,
     "strict": true,
     "skipLibCheck": true,

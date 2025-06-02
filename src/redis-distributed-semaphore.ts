@@ -1,10 +1,10 @@
 import { AcquireParams, IDistributedSemaphore, IReleaser } from "@apiratorjs/locking/dist/src/types";
-import assert from "node:assert";
+import * as assert from "node:assert";
 import { RedisClientType } from "redis";
 import { IDistributedDeferred } from "./types";
 import { types } from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
-import crypto from "node:crypto";
+import * as crypto from "node:crypto";
 import { DistributedReleaser } from "./distributed-releaser";
 import { BaseDistributedPrimitive } from "./base-distributed-primitive";
 
@@ -19,6 +19,55 @@ export class RedisDistributedSemaphore extends BaseDistributedPrimitive implemen
     assert.ok(maxCount > 0, "maxCount must be greater than 0");
 
     this.maxCount = maxCount;
+  }
+
+  public async waitForAnyUnlock(): Promise<void> {
+    this.throwIfDestroyed();
+
+    const freeCount = await this.freeCount();
+    if (freeCount > 0) {
+      return;
+    }
+
+    await this.ensureSubscriber();
+
+    return new Promise<void>((resolve) => {
+      const handler = async () => {
+        // Check if we now have any free slots
+        const currentFreeCount = await this.freeCount();
+        if (currentFreeCount > 0) {
+          this._redisSubscriber?.unsubscribe(`${this.name}:release`);
+          resolve();
+        }
+        // If not, keep listening for more release events
+      };
+      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+    });
+  }
+
+  public async waitForFullyUnlock(): Promise<void> {
+    this.throwIfDestroyed();
+
+    // Check if already fully unlocked
+    const freeCount = await this.freeCount();
+    if (freeCount === this.maxCount) {
+      return;
+    }
+
+    await this.ensureSubscriber();
+
+    return new Promise<void>((resolve) => {
+      const handler = async () => {
+        // Check if we're now fully unlocked
+        const currentFreeCount = await this.freeCount();
+        if (currentFreeCount === this.maxCount) {
+          this._redisSubscriber?.unsubscribe(`${this.name}:release`);
+          resolve();
+        }
+        // If not, keep listening for more release events
+      };
+      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+    });
   }
 
   public async destroy(): Promise<void> {
@@ -58,7 +107,7 @@ export class RedisDistributedSemaphore extends BaseDistributedPrimitive implemen
     return this.maxCount - currentCount;
   }
 
-  public async acquire(params?: AcquireParams): Promise<IReleaser> {
+  public async acquire(params?: AcquireParams): Promise<IReleaser<types.SemaphoreToken>> {
     this.throwIfDestroyed();
 
     await this.ensureSubscriber();
@@ -67,7 +116,7 @@ export class RedisDistributedSemaphore extends BaseDistributedPrimitive implemen
 
     const acquireToken = await this.tryAcquire(timeoutMs);
     if (acquireToken) {
-      return new DistributedReleaser(() => this.release(acquireToken), acquireToken);
+      return new DistributedReleaser<types.SemaphoreToken>(() => this.release(acquireToken), acquireToken as types.SemaphoreToken);
     }
 
     // Return a promise that resolves once the lock is eventually acquired.

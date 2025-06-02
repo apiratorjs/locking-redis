@@ -1,6 +1,6 @@
 import { RedisClientType } from "redis";
 import { IDistributedDeferred } from "./types";
-import assert from "node:assert";
+import * as assert from "node:assert";
 import { types } from "@apiratorjs/locking";
 import { DistributedReleaser } from "./distributed-releaser";
 
