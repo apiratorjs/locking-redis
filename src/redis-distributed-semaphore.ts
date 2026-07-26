@@ -1,241 +1,231 @@
-import { AcquireParams, IDistributedSemaphore, IReleaser } from "@apiratorjs/locking/dist/src/types";
-import * as assert from "node:assert";
+import assert from "node:assert";
+import crypto from "node:crypto";
 import { RedisClientType } from "redis";
-import { IDistributedDeferred } from "./types";
-import { types } from "@apiratorjs/locking";
+import {
+  CancelledLockingError,
+  ELockDisplayType,
+  LockNotFoundError,
+  TimeoutLockingError,
+  types,
+} from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
-import * as crypto from "node:crypto";
+import { IDistributedDeferred } from "./types";
 import { DistributedReleaser } from "./distributed-releaser";
-import { BaseDistributedPrimitive } from "./base-distributed-primitive";
+import { BaseDistributedLockPrimitive } from "./base-distributed-lock-primitive";
+import { RedisScript } from "./redis-script";
 
-export class RedisDistributedSemaphore extends BaseDistributedPrimitive implements IDistributedSemaphore {
+const RELEASE_SCRIPT = new RedisScript(`
+  local removed = redis.call('zrem', KEYS[1], ARGV[1])
+  return removed
+`);
+
+const ACQUIRE_SCRIPT = new RedisScript(`
+  -- Remove expired locks
+  redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
+
+  -- Check if there are free slots and add the lock in one atomic operation
+  local currentCount = redis.call('zcard', KEYS[1])
+  if currentCount < tonumber(ARGV[2]) then
+      redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
+
+      -- Set the key to expire if it is not already set to expire sooner
+      local keyTtl = redis.call('pttl', KEYS[1])
+        if keyTtl < tonumber(ARGV[5]) then
+            redis.call('pexpire', KEYS[1], ARGV[5])
+        end
+      return 1
+  end
+  return 0
+`);
+
+export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive implements types.IDistributedSemaphore {
   public readonly maxCount: number;
 
-  public constructor(props: types.DistributedSemaphoreConstructorProps & {
+  public constructor(props: types.TDistributedSemaphoreConstructorProps & {
     redisClient: RedisClientType;
   }) {
-    super({ ...props, name: `semaphore:${props.name}` });
-    const { maxCount } = props;
-    assert.ok(maxCount > 0, "maxCount must be greater than 0");
+    assert.ok(props.name, "RedisDistributedSemaphore requires a non-empty name.");
+    assert.ok(props.maxCount > 0, "maxCount must be greater than 0");
 
-    this.maxCount = maxCount;
+    super({ ...props, name: `${ELockDisplayType.Semaphore}:${props.name}` });
+    this.maxCount = props.maxCount;
   }
 
   public async waitForAnyUnlock(): Promise<void> {
-    this.throwIfDestroyed();
+    this.ensureAlive();
 
-    const freeCount = await this.freeCount();
-    if (freeCount > 0) {
-      return;
-    }
+    return this.waitForUnlockEvent(async () => {
+      // Treat destroy as unlocked so in-flight `:release` notify checks do not
+      // throw LockNotFoundError via freeCount() after destroyed is set.
+      if (this.destroyed) {
+        return true;
+      }
 
-    await this.ensureSubscriber();
-
-    return new Promise<void>((resolve) => {
-      const handler = async () => {
-        // Check if we now have any free slots
-        const currentFreeCount = await this.freeCount();
-        if (currentFreeCount > 0) {
-          this._redisSubscriber?.unsubscribe(`${this.name}:release`);
-          resolve();
-        }
-        // If not, keep listening for more release events
-      };
-      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+      return (await this.freeCount()) > 0;
     });
   }
 
   public async waitForFullyUnlock(): Promise<void> {
-    this.throwIfDestroyed();
+    this.ensureAlive();
 
-    // Check if already fully unlocked
-    const freeCount = await this.freeCount();
-    if (freeCount === this.maxCount) {
-      return;
-    }
+    return this.waitForUnlockEvent(async () => {
+      if (this.destroyed) {
+        return true;
+      }
 
-    await this.ensureSubscriber();
-
-    return new Promise<void>((resolve) => {
-      const handler = async () => {
-        // Check if we're now fully unlocked
-        const currentFreeCount = await this.freeCount();
-        if (currentFreeCount === this.maxCount) {
-          this._redisSubscriber?.unsubscribe(`${this.name}:release`);
-          resolve();
-        }
-        // If not, keep listening for more release events
-      };
-      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+      return (await this.freeCount()) === this.maxCount;
     });
   }
 
-  public async destroy(): Promise<void> {
-    if (this._isDestroyed) {
+  public async destroy(message?: string): Promise<void> {
+    if (this.destroyed) {
       return;
     }
 
-    this._isDestroyed = true;
+    this.destroyed = true;
 
-    await this._redisClient.del(this.name);
+    await this.redisClient.del(this.name);
 
-    if (this._redisSubscriber) {
-      await this._redisSubscriber.unsubscribe(`${this.name}:cancel`);
-      await this._redisSubscriber.unsubscribe(`${this.name}:release`);
-      await this._redisSubscriber.unsubscribe(`${this.name}:destroy`);
-      await this._redisSubscriber.disconnect();
-      this._redisSubscriber = undefined;
+    if (this.redisSubscriber) {
+      await this.redisSubscriber.unsubscribe(`${this.name}:cancel`);
+      await this.redisSubscriber.unsubscribe(`${this.name}:release`);
+      await this.redisSubscriber.unsubscribe(`${this.name}:destroy`);
+      await this.redisSubscriber.disconnect();
+      this.redisSubscriber = undefined;
     }
 
-    await this._redisClient.publish(`${this.name}:destroy`, "destroyed");
+    await this.redisClient.publish(`${this.name}:destroy`, "destroyed");
 
-    while (this._queue.length > 0) {
-      const deferred = this._queue.shift()!;
-
-      if (deferred.timer) {
-        clearTimeout(deferred.timer);
-        deferred.timer = null;
-      }
-
-      deferred.reject(new Error("Semaphore destroyed"));
-    }
+    this.rejectQueuedAcquirers(new CancelledLockingError(message ?? "Semaphore destroyed"));
+    this.resolveUnlockWaiters();
   }
 
   public async freeCount(): Promise<number> {
-    await this._redisClient.zRemRangeByScore(this.name, "-inf", Date.now());
-    const currentCount = await this._redisClient.zCard(this.name);
+    this.ensureAlive();
+
+    await this.redisClient.zRemRangeByScore(this.name, "-inf", Date.now());
+    const currentCount = await this.redisClient.zCard(this.name);
     return this.maxCount - currentCount;
   }
 
-  public async acquire(params?: AcquireParams): Promise<IReleaser<types.SemaphoreToken>> {
-    this.throwIfDestroyed();
+  public async acquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TSemaphoreToken>> {
+    this.ensureAlive();
 
     await this.ensureSubscriber();
 
-    const { timeoutMs = DEFAULT_TTL_MS } = params ?? {};
+    // `??` and not `||`: timeoutMs 0 means "fail fast", not "use the default".
+    const timeoutMs = params?.timeoutMs ?? DEFAULT_TTL_MS;
+    // Lock member expiry must stay positive even when the wait timeout is 0.
+    const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
-    const acquireToken = await this.tryAcquire(timeoutMs);
+    const acquireToken = await this.tryAcquire(lockTtlMs);
     if (acquireToken) {
-      return new DistributedReleaser<types.SemaphoreToken>(() => this.release(acquireToken), acquireToken as types.SemaphoreToken);
+      return new DistributedReleaser<types.TSemaphoreToken>(
+        () => this.release(acquireToken),
+        acquireToken as types.TSemaphoreToken,
+      );
     }
 
-    // Return a promise that resolves once the lock is eventually acquired.
+    if (timeoutMs === 0) {
+      throw new TimeoutLockingError("Timeout acquiring");
+    }
+
     return new Promise((resolve, reject) => {
       const deferred: IDistributedDeferred = {
         resolve,
         reject,
-        ttlMs: timeoutMs,
-        timer: null
+        ttlMs: lockTtlMs,
+        timer: null,
       };
 
       deferred.timer = setTimeout(() => {
-        const index = this._queue.indexOf(deferred);
+        const index = this.queue.indexOf(deferred);
         if (index !== -1) {
-          this._queue.splice(index, 1);
+          this.queue.splice(index, 1);
         }
 
-        reject(new Error("Timeout acquiring"));
+        reject(new TimeoutLockingError("Timeout acquiring"));
       }, timeoutMs);
+      deferred.timer.unref();
 
-      this._queue.push(deferred);
+      this.queue.push(deferred);
     });
-  }
-
-  protected async release(token: types.AcquireToken): Promise<void> {
-    this.throwIfDestroyed();
-
-    const RELEASE_LUA = `
-      local removed = redis.call('zrem', KEYS[1], ARGV[1])
-      return removed
-    `;
-
-    const removed = await this._redisClient.eval(RELEASE_LUA, {
-      keys: [this.name],
-      arguments: [token]
-    });
-
-    // Only publish release message if a token was actually removed
-    if (removed === 1) {
-      await this._redisClient.publish(`${this.name}:release`, token);
-    }
   }
 
   public async cancelAll(errMessage?: string): Promise<void> {
-    this.throwIfDestroyed();
+    this.ensureAlive();
 
-    const msg = `cancel:${errMessage ?? ""}`;
-    await this._redisClient.publish(`${this.name}:cancel`, msg);
+    const msg = `cancel:${errMessage ?? "Semaphore cancelled"}`;
+    await this.redisClient.publish(`${this.name}:cancel`, msg);
   }
 
   public async isLocked(): Promise<boolean> {
+    this.ensureAlive();
+
     const free = await this.freeCount();
     return free === 0;
   }
 
-  public async runExclusive<T>(fn: () => Promise<T> | T): Promise<T>
-  public async runExclusive<T>(params: types.AcquireParams, fn: () => Promise<T> | T): Promise<T>
+  public async runExclusive<T>(fn: () => Promise<T> | T): Promise<T>;
+  public async runExclusive<T>(params: types.TAcquireParams, fn: () => Promise<T> | T): Promise<T>;
   public async runExclusive<T>(...args: any[]): Promise<T> {
-    let params: types.AcquireParams | undefined;
-    let fn: () => Promise<T> | T;
+    let callback: () => Promise<T> | T;
+    let params: types.TAcquireParams | undefined;
 
     if (args.length === 1) {
-      fn = args[0];
-    } else if (args.length === 2) {
-      params = args[0];
-      fn = args[1];
+      callback = args[0];
     } else {
-      throw new Error("Invalid arguments for runExclusive");
+      params = args[0];
+      callback = args[1];
     }
 
     const releaser = await this.acquire(params);
     try {
-      return await fn();
+      return await callback();
     } finally {
-      await this.release(releaser.getToken());
+      await releaser.release();
     }
   }
 
-  protected async tryAcquire(ttlMs: number): Promise<types.AcquireToken | undefined> {
-    const ACQUIRE_LUA = `
-      -- Remove expired locks
-      redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
-      
-      -- Check if there are free slots and add the lock in one atomic operation
-      local currentCount = redis.call('zcard', KEYS[1])
-      if currentCount < tonumber(ARGV[2]) then
-          redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
-          
-          -- Set the key to expire if it is not already set to expire sooner
-          local keyTtl = redis.call('pttl', KEYS[1])
-            if keyTtl < tonumber(ARGV[5]) then
-                redis.call('pexpire', KEYS[1], ARGV[5])
-            end
-          return 1
-      end
-      return 0
-    `;
-
-    const token = `${this.name}:${crypto.randomUUID()}` as types.AcquireToken;
+  protected async tryAcquire(ttlMs: number): Promise<types.TAcquireToken | undefined> {
+    const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
     const now = Date.now();
     const expiryTimestamp = now + ttlMs;
 
-    const result = await this._redisClient.eval(ACQUIRE_LUA, {
+    const result = await ACQUIRE_SCRIPT.run(this.redisClient, {
       keys: [this.name],
       arguments: [
-        now.toString(),                // Current time for expiry check
-        this.maxCount.toString(),      // Max count of semaphore
-        expiryTimestamp.toString(),    // Expiry timestamp for the new lock
-        token,                         // Token for the lock
-        (ttlMs * 3).toString()         // TTL for the key in Redis
-      ]
+        now.toString(),
+        this.maxCount.toString(),
+        expiryTimestamp.toString(),
+        token,
+        (ttlMs * 3).toString(),
+      ],
     });
 
     return result === 1 ? token : undefined;
   }
 
-  private throwIfDestroyed(): void {
-    if (this._isDestroyed) {
-      throw new Error("Semaphore has been destroyed");
+  protected async release(token: types.TAcquireToken): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
+
+    const removed = await RELEASE_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token],
+    });
+
+    if (removed === 1) {
+      await this.redisClient.publish(`${this.name}:release`, token);
+    }
+  }
+
+  private ensureAlive(): void {
+    if (this.destroyed) {
+      throw new LockNotFoundError(
+        `${ELockDisplayType.Semaphore} '${this.name}' does not exist`,
+      );
     }
   }
 }

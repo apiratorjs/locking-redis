@@ -1,189 +1,188 @@
-import { types } from "@apiratorjs/locking";
+import assert from "node:assert";
+import crypto from "node:crypto";
 import { RedisClientType } from "redis";
-import * as crypto from "node:crypto";
+import {
+  CancelledLockingError,
+  ELockDisplayType,
+  LockNotFoundError,
+  TimeoutLockingError,
+  types,
+} from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
 import { IDistributedDeferred } from "./types";
-import { IReleaser } from "@apiratorjs/locking/dist/src/types";
 import { DistributedReleaser } from "./distributed-releaser";
-import { BaseDistributedPrimitive } from "./base-distributed-primitive";
+import { BaseDistributedLockPrimitive } from "./base-distributed-lock-primitive";
+import { RedisScript } from "./redis-script";
 
-export class RedisDistributedMutex extends BaseDistributedPrimitive implements types.IDistributedMutex {
-  /**
-   * Holds the random lock token if we successfully acquire it.
-   * Using a random token helps ensure that only the owner can release.
-   */
-  private _lockValue?: types.AcquireToken;
+/**
+ * Only release if the lock key's value matches our lock token.
+ */
+const RELEASE_SCRIPT = new RedisScript(`
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  end
+  return 0
+`);
 
-  public constructor(props: types.DistributedMutexConstructorProps & {
+export class RedisDistributedMutex extends BaseDistributedLockPrimitive implements types.IDistributedMutex {
+  public constructor(props: types.TDistributedMutexConstructorProps & {
     redisClient: RedisClientType;
   }) {
-    super({ ...props, name: `mutex:${props.name}` });
+    assert.ok(props.name, "RedisDistributedMutex requires a non-empty name.");
+    super({ ...props, name: `${ELockDisplayType.Mutex}:${props.name}` });
   }
 
-  public async destroy(): Promise<void> {
-    if (this._isDestroyed) {
+  public async destroy(message?: string): Promise<void> {
+    if (this.destroyed) {
       return;
     }
 
-    this._isDestroyed = true;
+    this.destroyed = true;
 
-    await this._redisClient.del(this.name);
+    await this.redisClient.del(this.name);
 
-    if (this._redisSubscriber) {
-      await this._redisSubscriber.unsubscribe(`${this.name}:cancel`);
-      await this._redisSubscriber.unsubscribe(`${this.name}:release`);
-      await this._redisSubscriber.unsubscribe(`${this.name}:destroy`);
-      await this._redisSubscriber.disconnect();
-      this._redisSubscriber = undefined;
+    if (this.redisSubscriber) {
+      await this.redisSubscriber.unsubscribe(`${this.name}:cancel`);
+      await this.redisSubscriber.unsubscribe(`${this.name}:release`);
+      await this.redisSubscriber.unsubscribe(`${this.name}:destroy`);
+      await this.redisSubscriber.disconnect();
+      this.redisSubscriber = undefined;
     }
 
-    await this._redisClient.publish(`${this.name}:destroy`, "destroyed");
+    await this.redisClient.publish(`${this.name}:destroy`, "destroyed");
 
-    while (this._queue.length > 0) {
-      const deferred = this._queue.shift()!;
-
-      if (deferred.timer) {
-        clearTimeout(deferred.timer);
-        deferred.timer = null;
-      }
-
-      deferred.reject(new Error("Mutex destroyed"));
-    }
+    this.rejectQueuedAcquirers(new CancelledLockingError(message ?? "Mutex destroyed"));
+    this.resolveUnlockWaiters();
   }
 
-  public async acquire(params?: types.AcquireParams): Promise<IReleaser<types.MutexToken>> {
-    this.throwIfDestroyed();
+  public async acquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TMutexToken>> {
+    this.ensureAlive();
 
     await this.ensureSubscriber();
 
-    const { timeoutMs = DEFAULT_TTL_MS } = params ?? {};
+    // `??` and not `||`: timeoutMs 0 means "fail fast", not "use the default".
+    const timeoutMs = params?.timeoutMs ?? DEFAULT_TTL_MS;
+    // Redis PX must be positive; a zero wait timeout still needs a real lock TTL.
+    const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
-    const acquireToken = await this.tryAcquire(timeoutMs);
+    const acquireToken = await this.tryAcquire(lockTtlMs);
     if (acquireToken) {
-      return new DistributedReleaser<types.MutexToken>(() => this.release(acquireToken), acquireToken as types.MutexToken);
+      return new DistributedReleaser<types.TMutexToken>(
+        () => this.release(acquireToken),
+        acquireToken as types.TMutexToken,
+      );
     }
 
-    // Return a promise that resolves once the lock is eventually acquired.
+    if (timeoutMs === 0) {
+      throw new TimeoutLockingError("Timeout acquiring");
+    }
+
     return new Promise((resolve, reject) => {
       const deferred: IDistributedDeferred = {
         resolve,
         reject,
-        ttlMs: timeoutMs,
-        timer: null
+        ttlMs: lockTtlMs,
+        timer: null,
       };
 
       deferred.timer = setTimeout(() => {
-        const index = this._queue.indexOf(deferred);
+        const index = this.queue.indexOf(deferred);
         if (index !== -1) {
-          this._queue.splice(index, 1);
+          this.queue.splice(index, 1);
         }
 
-        reject(new Error("Timeout acquiring"));
+        reject(new TimeoutLockingError("Timeout acquiring"));
       }, timeoutMs);
+      deferred.timer.unref();
 
-      this._queue.push(deferred);
+      this.queue.push(deferred);
     });
   }
 
   public async cancel(errMessage?: string): Promise<void> {
-    this.throwIfDestroyed();
+    this.ensureAlive();
 
-    const msg = `cancel:${errMessage ?? ""}`;
-    await this._redisClient.publish(`${this.name}:cancel`, msg);
+    const msg = `cancel:${errMessage ?? "Mutex cancelled"}`;
+    await this.redisClient.publish(`${this.name}:cancel`, msg);
   }
 
   public async isLocked(): Promise<boolean> {
-    const val = await this._redisClient.get(this.name);
+    this.ensureAlive();
+
+    const val = await this.redisClient.get(this.name);
     return val !== null;
   }
 
-  public async runExclusive<T>(fn: () => Promise<T> | T): Promise<T>
-  public async runExclusive<T>(params: types.AcquireParams, fn: () => Promise<T> | T): Promise<T>
+  public async runExclusive<T>(fn: () => Promise<T> | T): Promise<T>;
+  public async runExclusive<T>(params: types.TAcquireParams, fn: () => Promise<T> | T): Promise<T>;
   public async runExclusive<T>(...args: any[]): Promise<T> {
-    let params: types.AcquireParams | undefined;
-    let fn: () => Promise<T> | T;
+    let callback: () => Promise<T> | T;
+    let params: types.TAcquireParams | undefined;
 
     if (args.length === 1) {
-      fn = args[0];
-    } else if (args.length === 2) {
-      params = args[0];
-      fn = args[1];
+      callback = args[0];
     } else {
-      throw new Error("Invalid arguments for runExclusive");
+      params = args[0];
+      callback = args[1];
     }
 
     const releaser = await this.acquire(params);
     try {
-      return await fn();
+      return await callback();
     } finally {
       await releaser.release();
     }
   }
 
   public async waitForUnlock(): Promise<void> {
-    this.throwIfDestroyed();
-    
-    // If not currently locked, return immediately
-    const isLocked = await this.isLocked();
-    if (!isLocked) {
-      return;
-    }
+    this.ensureAlive();
 
-    // Otherwise wait for a release event
-    await this.ensureSubscriber();
-    
-    const releaseEvent = new Promise<void>((resolve) => {
-      const handler = () => {
-        this._redisSubscriber?.unsubscribe(`${this.name}:release`);
-        resolve();
-      };
-      this._redisSubscriber?.subscribe(`${this.name}:release`, handler);
+    return this.waitForUnlockEvent(async () => {
+      // Treat destroy as unlocked so in-flight `:release` notify checks do not
+      // throw LockNotFoundError via isLocked() after destroyed is set.
+      if (this.destroyed) {
+        return true;
+      }
+
+      return !(await this.isLocked());
     });
-
-    await releaseEvent;
   }
 
-  protected async tryAcquire(timeoutMs: number): Promise<types.AcquireToken | undefined> {
-    const token = `${this.name}:${crypto.randomUUID()}` as types.AcquireToken;
+  protected async tryAcquire(timeoutMs: number): Promise<types.TAcquireToken | undefined> {
+    const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
 
-    const result = await this._redisClient.set(this.name, token, {
+    const result = await this.redisClient.set(this.name, token, {
       NX: true,
-      PX: timeoutMs
+      PX: timeoutMs,
     });
 
     if (result === "OK") {
-      this._lockValue = token;
       return token;
     }
 
     return undefined;
   }
 
-  private throwIfDestroyed(): void {
-    if (this._isDestroyed) {
-      throw new Error("Mutex has been destroyed");
+  protected async release(token: types.TAcquireToken): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
+
+    const result = await RELEASE_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token],
+    });
+
+    if (result === 1) {
+      await this.redisClient.publish(`${this.name}:release`, token);
     }
   }
 
-  protected async release(token: types.AcquireToken): Promise<void> {
-    this.throwIfDestroyed();
-
-    // Only release if the lock key's value matches our lockValue
-    const RELEASE_LUA = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      end
-      return 0
-    `;
-    const result = await this._redisClient.eval(RELEASE_LUA, {
-      keys: [this.name],
-      arguments: [this._lockValue ?? ""]
-    });
-
-    // If we successfully released, let the next queue item know they can try
-    if (result === 1) {
-      await this._redisClient.publish(`${this.name}:release`, token);
-      this._lockValue = undefined;
+  private ensureAlive(): void {
+    if (this.destroyed) {
+      throw new LockNotFoundError(
+        `${ELockDisplayType.Mutex} '${this.name}' does not exist`,
+      );
     }
   }
 }
