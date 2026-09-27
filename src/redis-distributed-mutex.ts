@@ -9,27 +9,30 @@ import {
   types,
 } from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
-import { IDistributedDeferred } from "./types";
-import { DistributedReleaser } from "./distributed-releaser";
+import { IDistributedDeferred, ILeaseOperations } from "./types";
+import { RedisLeaseReleaser } from "./lease-releaser";
 import { BaseDistributedLockPrimitive } from "./base-distributed-lock-primitive";
-import { RedisScript } from "./redis-script";
-
-/**
- * Only release if the lock key's value matches our lock token.
- */
-const RELEASE_SCRIPT = new RedisScript(`
-  if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-  end
-  return 0
-`);
+import {
+  MUTEX_ACQUIRE_SCRIPT,
+  MUTEX_EXTEND_SCRIPT,
+  MUTEX_RELEASE_SCRIPT,
+  MUTEX_REMAINING_TTL_SCRIPT,
+} from "./lua-scripts";
+import { assertTtl, ttlArgument } from "./utils";
 
 export class RedisDistributedMutex extends BaseDistributedLockPrimitive implements types.IDistributedMutex {
+  private readonly lockOperations: ILeaseOperations<types.TMutexToken>;
+
   public constructor(props: types.TDistributedMutexConstructorProps & {
     redisClient: RedisClientType;
   }) {
     assert.ok(props.name, "RedisDistributedMutex requires a non-empty name.");
     super({ ...props, name: `${ELockDisplayType.Mutex}:${props.name}` });
+    this.lockOperations = {
+      release: async (token) => this.release(token),
+      extend: async (token, ttlMs) => this.extendLock(token, ttlMs),
+      remainingTtl: async (token) => this.lockRemainingTtl(token),
+    };
   }
 
   public async destroy(message?: string): Promise<void> {
@@ -38,6 +41,7 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     }
 
     this.destroyed = true;
+    this.clearExpiryWake();
 
     await this.redisClient.del(this.name);
 
@@ -55,22 +59,20 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     this.resolveUnlockWaiters();
   }
 
-  public async acquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TMutexToken>> {
+  public async acquire(params?: types.TMutexAcquireParams): Promise<types.IMutexReleaser> {
     this.ensureAlive();
+
+    const lockTtlMs = params?.ttlMs ?? DEFAULT_TTL_MS;
+    assertTtl(lockTtlMs);
 
     await this.ensureSubscriber();
 
     // `??` and not `||`: timeoutMs 0 means "fail fast", not "use the default".
     const timeoutMs = params?.timeoutMs ?? DEFAULT_TTL_MS;
-    // Redis PX must be positive; a zero wait timeout still needs a real lock TTL.
-    const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
     const acquireToken = await this.acquireOnce(lockTtlMs);
     if (acquireToken) {
-      return new DistributedReleaser<types.TMutexToken>(
-        () => this.release(acquireToken),
-        acquireToken as types.TMutexToken,
-      );
+      return this.createReleaser(acquireToken);
     }
 
     if (timeoutMs === 0) {
@@ -99,7 +101,7 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     });
   }
 
-  public async tryAcquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TMutexToken> | null> {
+  public async tryAcquire(params?: types.TMutexAcquireParams): Promise<types.IMutexReleaser | null> {
     const timeoutMs = params?.timeoutMs ?? 0;
 
     try {
@@ -113,6 +115,12 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     }
   }
 
+  public restoreReleaser(token: types.TMutexToken): types.IMutexReleaser {
+    this.ensureAlive();
+
+    return this.createReleaser(token);
+  }
+
   public async cancel(errMessage?: string): Promise<void> {
     this.ensureAlive();
 
@@ -123,8 +131,11 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
   public async isLocked(): Promise<boolean> {
     this.ensureAlive();
 
-    const val = await this.redisClient.get(this.name);
-    return val !== null;
+    const ttl = await this.redisClient.pTTL(this.name);
+    // Whoever waits for the unlock has to look again once the lock expires.
+    this.scheduleExpiryWake(ttl);
+
+    return ttl !== -2;
   }
 
   public async runExclusive<T>(fn: () => Promise<T> | T): Promise<T>;
@@ -162,19 +173,24 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     });
   }
 
-  protected async acquireOnce(timeoutMs: number): Promise<types.TAcquireToken | undefined> {
+  protected async acquireOnce(ttlMs: number): Promise<types.TAcquireToken | undefined> {
     const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
 
-    const result = await this.redisClient.set(this.name, token, {
-      NX: true,
-      PX: timeoutMs,
-    });
+    const [acquired, lockTtlMs] = await MUTEX_ACQUIRE_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token, ttlArgument(ttlMs)],
+    }) as [number, number?];
 
-    if (result === "OK") {
+    if (acquired === 1) {
       return token;
     }
 
+    this.scheduleExpiryWake(lockTtlMs ?? -1);
     return undefined;
+  }
+
+  protected createReleaser(token: types.TAcquireToken): types.IMutexReleaser {
+    return new RedisLeaseReleaser(this.lockOperations, token as types.TMutexToken);
   }
 
   protected async release(token: types.TAcquireToken): Promise<void> {
@@ -182,7 +198,7 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
       return;
     }
 
-    const result = await RELEASE_SCRIPT.run(this.redisClient, {
+    const result = await MUTEX_RELEASE_SCRIPT.run(this.redisClient, {
       keys: [this.name],
       arguments: [token],
     });
@@ -190,6 +206,38 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     if (result === 1) {
       await this.redisClient.publish(`${this.name}:release`, token);
     }
+  }
+
+  private async extendLock(token: types.TMutexToken, ttlMs: number): Promise<boolean> {
+    assertTtl(ttlMs);
+
+    if (this.destroyed) {
+      return false;
+    }
+
+    const extended = await MUTEX_EXTEND_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token, ttlArgument(ttlMs)],
+    });
+
+    return extended === 1;
+  }
+
+  private async lockRemainingTtl(token: types.TMutexToken): Promise<number | null> {
+    if (this.destroyed) {
+      return null;
+    }
+
+    const remaining = await MUTEX_REMAINING_TTL_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token],
+    }) as number;
+
+    if (remaining === -2) {
+      return null;
+    }
+
+    return remaining === -1 ? Infinity : remaining;
   }
 
   private ensureAlive(): void {

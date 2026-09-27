@@ -10,3 +10,11 @@ export interface IUnlockWaiter {
   resolve: () => void;
   reject: (error: Error) => void;
 }
+
+export interface ILeaseOperations<T extends types.TAcquireToken> {
+  release(token: T): Promise<void>;
+
+  extend(token: T, ttlMs: number): Promise<boolean>;
+
+  remainingTtl(token: T): Promise<number | null>;
+}

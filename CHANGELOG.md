@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-09-27
+
+Compared to **3.0.0**. Requires [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^8.0.0** and Redis **5+**.
+
+### Breaking Changes
+
+- Peer dependency `@apiratorjs/locking` bumped from **^6.0.0** to **^8.0.0**. Locking 7 and 8 add `restoreReleaser()` and `ISemaphoreReleaser` / `IMutexReleaser` to the semaphore and mutex contracts, so this package no longer works with locking 6.x or 7.x.
+- A lock's lifetime no longer follows `timeoutMs`, for semaphores and mutexes alike. Before, `acquire({ timeoutMs: 5000 })` silently gave a permit or lock that expired after 5 seconds, and `tryAcquire()` one that expired after 1 minute. Now it lives for `ttlMs`, or 1 minute without it, however long the acquisition was allowed to wait. Code that relied on a long `timeoutMs` keeping the lock for as long must pass `ttlMs` instead.
+- `BaseDistributedLockPrimitive` declares a new protected abstract `createReleaser(token)`, and the queue draining moved from the `:release` subscription into the protected `drainQueue()`. Only affects code that subclasses the base class.
+
+### Added
+
+- `ttlMs` when acquiring a semaphore permit or a mutex lock (`acquire()` / `tryAcquire()`), counted from the moment it is granted. `Infinity` means no TTL.
+- Releasers are `ISemaphoreReleaser` / `IMutexReleaser`: `extend(ttlMs)`, `remainingTtl()`, `isHeld()` on top of `release()` / `getToken()`.
+- `restoreReleaser(token)` on `RedisDistributedSemaphore` and `RedisDistributedMutex`: rebuilds the releaser from its token, in any process.
+
+### Behavior
+
+- Permits and locks are addressed by token. `release()` is idempotent per token across releasers and processes; releasing an expired one is a no-op and never frees what was granted to somebody else since. The internal `DistributedReleaser` is replaced by a releaser without local state.
+- Queued acquirers and `waitForUnlock()` / `waitForAnyUnlock()` / `waitForFullyUnlock()` are woken when a permit or lock expires, not only when one is released. Before, they waited for the next release or their own timeout.
+- Semaphore scripts use the Redis server clock (`TIME`) instead of each client's `Date.now()`; mutex expiry is the key's own `PX`.
+- The semaphore key expires together with its longest-lived permit, and has no expiry while it holds a permit without a TTL.
+- `freeCount()` / `isLocked()` of the semaphore run as a single script instead of two commands.
+
+### Migration checklist
+
+1. Upgrade `@apiratorjs/locking` to **^8.0.0** alongside `@apiratorjs/locking-redis` **^4.0.0**.
+2. Where a permit or lock may be held longer than 1 minute, pass `ttlMs` (or `Infinity`) instead of relying on `timeoutMs`.
+3. If you subclass `BaseDistributedLockPrimitive`, implement `createReleaser(token)`.
+
 ## [3.0.0] - 2026-09-27
 
 Compared to **2.0.0**. Requires [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^6.0.0**.

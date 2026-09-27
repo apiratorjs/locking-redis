@@ -2,7 +2,7 @@ import assert from "node:assert";
 import { RedisClientType } from "redis";
 import { CancelledLockingError, types } from "@apiratorjs/locking";
 import { IDistributedDeferred, IUnlockWaiter } from "./types";
-import { DistributedReleaser } from "./distributed-releaser";
+import { MAX_TIMER_DELAY_IN_MS } from "./constants";
 
 export abstract class BaseDistributedLockPrimitive {
   public readonly name: string;
@@ -13,6 +13,8 @@ export abstract class BaseDistributedLockPrimitive {
   protected queue: IDistributedDeferred[];
   protected unlockWaiters: Set<IUnlockWaiter> = new Set();
   protected destroyed: boolean = false;
+  private expiryWakeTimer?: NodeJS.Timeout;
+  private expiryWakeAt?: number;
 
   protected constructor(props: {
     name: string;
@@ -51,32 +53,34 @@ export abstract class BaseDistributedLockPrimitive {
     });
 
     await this.redisSubscriber.subscribe(`${this.name}:release`, async () => {
-      while (this.queue.length > 0) {
-        const nextInQueue = this.queue.shift() as IDistributedDeferred;
-        const acquireToken = await this.acquireOnce(nextInQueue.ttlMs);
-        if (!acquireToken) {
-          this.queue.unshift(nextInQueue);
-          break;
-        }
-
-        if (nextInQueue.timer) {
-          clearTimeout(nextInQueue.timer);
-          nextInQueue.timer = null;
-        }
-
-        const releaser = new DistributedReleaser(() => this.release(acquireToken), acquireToken);
-
-        nextInQueue.resolve(releaser);
-      }
-
-      // Queued acquirers get first refusal; only what is left over frees up
-      // the waiters of waitForUnlock / waitForAnyUnlock / waitForFullyUnlock.
-      await this.notifyUnlockWaiters();
+      await this.drainQueue();
     });
 
     await this.redisSubscriber.subscribe(`${this.name}:destroy`, async () => {
       await this.destroy();
     });
+  }
+
+  protected async drainQueue(): Promise<void> {
+    while (this.queue.length > 0) {
+      const nextInQueue = this.queue.shift() as IDistributedDeferred;
+      const acquireToken = await this.acquireOnce(nextInQueue.ttlMs);
+      if (!acquireToken) {
+        this.queue.unshift(nextInQueue);
+        break;
+      }
+
+      if (nextInQueue.timer) {
+        clearTimeout(nextInQueue.timer);
+        nextInQueue.timer = null;
+      }
+
+      nextInQueue.resolve(this.createReleaser(acquireToken));
+    }
+
+    // Queued acquirers get first refusal; only what is left over frees up
+    // the waiters of waitForUnlock / waitForAnyUnlock / waitForFullyUnlock.
+    await this.notifyUnlockWaiters();
   }
 
   /**
@@ -156,6 +160,45 @@ export abstract class BaseDistributedLockPrimitive {
     }
   }
 
+  protected scheduleExpiryWake(inMs: number): void {
+    if (inMs < 0 || this.destroyed) {
+      return;
+    }
+
+    const at = Date.now() + inMs;
+    if (this.expiryWakeTimer && this.expiryWakeAt !== undefined && this.expiryWakeAt <= at) {
+      return;
+    }
+
+    this.clearExpiryWake();
+
+    this.expiryWakeAt = at;
+    this.expiryWakeTimer = setTimeout(() => {
+      this.expiryWakeTimer = undefined;
+      this.expiryWakeAt = undefined;
+      void this.onExpiryWake();
+    }, Math.min(inMs + 1, MAX_TIMER_DELAY_IN_MS));
+    this.expiryWakeTimer.unref();
+  }
+
+  protected clearExpiryWake(): void {
+    clearTimeout(this.expiryWakeTimer);
+    this.expiryWakeTimer = undefined;
+    this.expiryWakeAt = undefined;
+  }
+
+  private async onExpiryWake(): Promise<void> {
+    if (this.destroyed || (this.queue.length === 0 && this.unlockWaiters.size === 0)) {
+      return;
+    }
+
+    try {
+      await this.drainQueue();
+    } catch {
+      // Waiters are still settled by the next release or their own timeout
+    }
+  }
+
   protected rejectQueuedAcquirers(error: Error): void {
     while (this.queue.length > 0) {
       const deferred = this.queue.shift()!;
@@ -181,6 +224,8 @@ export abstract class BaseDistributedLockPrimitive {
   }
 
   protected abstract acquireOnce(ttlMs: number): Promise<types.TAcquireToken | undefined>;
+
+  protected abstract createReleaser(token: types.TAcquireToken): types.IReleaser;
 
   protected abstract destroy(): Promise<void>;
 

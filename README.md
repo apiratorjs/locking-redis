@@ -6,10 +6,10 @@
 An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/locking) library, providing a Redis-backed
 `IDistributedLockManager` with distributed mutexes and semaphores for true cross-process concurrency control in Node.js.
 
-> **Note:** Requires Node.js version **>=16.4.0**, [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^6.0.0**,
-> and a running Redis instance (version 5+ recommended).
+> **Note:** Requires Node.js version **>=16.4.0**, [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^8.0.0**,
+> and a running Redis instance, version 5 or newer.
 >
-> Upgrading from 1.x? See [CHANGELOG](./CHANGELOG.md) and [2.0.0 release notes](./RELEASE_NOTES.md).
+> Upgrading from 3.x? See [CHANGELOG](./CHANGELOG.md) and [4.0.0 release notes](./RELEASE_NOTES.md).
 
 ---
 
@@ -30,6 +30,8 @@ An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/loc
 - **Named locks** — the same name returns the same live instance while it is alive; `list()`, `count()`, `snapshot()`,
   `cancelAll()`, and `destroyAll()` for inspection and shutdown.
 - **Time-limited locks (TTL)** — prevents deadlocks if processes crash without releasing.
+- **Locks and permits handed over by token** — release, extend or inspect a mutex lock or a semaphore permit from
+  another process (e.g. a job queue worker), with an explicit `ttlMs`.
 - **Cancellation, timeouts, and FIFO waiters** — cancel blocked acquisitions, fail fast with `timeoutMs: 0`, queue
   waiters in order.
 - **Non-throwing `tryAcquire()`** — returns a releaser, or `null` when the lock is busy (no wait by default).
@@ -137,6 +139,10 @@ await mutex.cancel("Operation cancelled");
 await mutex.waitForUnlock();
 ```
 
+The mutex supports the same `ttlMs`, `restoreReleaser(token)`, `extend()`, `remainingTtl()` and `isHeld()` as the
+semaphore - see [Permit TTL and handing permits over](#permit-ttl-and-handing-permits-over). A lock expires after
+`ttlMs`, or after 1 minute by default, regardless of `timeoutMs`.
+
 ### Distributed Semaphore
 
 ```typescript
@@ -160,6 +166,45 @@ await semaphore.cancelAll("Operation cancelled");
 await semaphore.waitForAnyUnlock();
 await semaphore.waitForFullyUnlock();
 ```
+
+#### Permit TTL and handing permits over
+
+Every semaphore permit expires: after `ttlMs` if given, otherwise after 1 minute, so a crashed holder cannot take a slot
+forever. The TTL counts from the moment the permit is granted and is independent of `timeoutMs`, which only bounds the
+wait. `ttlMs: Infinity` opts out of expiry - the permit is then held until released, even if its holder is gone.
+
+A permit is identified by its token, so it can be released, extended or inspected from any process through
+`restoreReleaser(token)`:
+
+```typescript
+const semaphore = locks.semaphore("exports", 3);
+
+// Producer: take a slot or skip, and hand the permit over to the job
+const releaser = await semaphore.tryAcquire({ ttlMs: 10 * 60_000 });
+if (!releaser) {
+  return; // all slots busy
+}
+await queue.add("export", { permitToken: releaser.getToken() });
+
+// Worker, possibly in another process
+const permit = locks.semaphore("exports", 3).restoreReleaser(job.data.permitToken);
+if (!(await permit.isHeld())) {
+  return; // expired while waiting in the queue
+}
+
+try {
+  // ... work, calling permit.extend(10 * 60_000) while it goes on
+} finally {
+  await permit.release();
+}
+```
+
+- `extend(ttlMs)` sets a new TTL counted from now; `extend(Infinity)` removes it. Returns `false` once the permit is gone.
+- `remainingTtl()` returns the milliseconds left, `Infinity` without a TTL, `null` once the permit is gone.
+- `release()` is idempotent per token across all processes, and a holder whose permit already expired cannot release
+  the permit of whoever got it next.
+- An expired permit wakes up queued acquirers and `waitForAnyUnlock()` / `waitForFullyUnlock()` without any release.
+- Expiry is measured by the Redis server clock, so hosts with drifting clocks agree on it.
 
 ### Managing locks
 

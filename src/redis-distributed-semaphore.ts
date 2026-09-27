@@ -9,37 +9,22 @@ import {
   types,
 } from "@apiratorjs/locking";
 import { DEFAULT_TTL_MS } from "./constants";
-import { IDistributedDeferred } from "./types";
-import { DistributedReleaser } from "./distributed-releaser";
+import { IDistributedDeferred, ILeaseOperations } from "./types";
 import { BaseDistributedLockPrimitive } from "./base-distributed-lock-primitive";
-import { RedisScript } from "./redis-script";
-
-const RELEASE_SCRIPT = new RedisScript(`
-  local removed = redis.call('zrem', KEYS[1], ARGV[1])
-  return removed
-`);
-
-const ACQUIRE_SCRIPT = new RedisScript(`
-  -- Remove expired locks
-  redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
-
-  -- Check if there are free slots and add the lock in one atomic operation
-  local currentCount = redis.call('zcard', KEYS[1])
-  if currentCount < tonumber(ARGV[2]) then
-      redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
-
-      -- Set the key to expire if it is not already set to expire sooner
-      local keyTtl = redis.call('pttl', KEYS[1])
-        if keyTtl < tonumber(ARGV[5]) then
-            redis.call('pexpire', KEYS[1], ARGV[5])
-        end
-      return 1
-  end
-  return 0
-`);
+import { RedisLeaseReleaser } from "./lease-releaser";
+import { assertTtl, ttlArgument } from "./utils";
+import {
+  SEMAPHORE_ACQUIRE_SCRIPT,
+  SEMAPHORE_COUNT_SCRIPT,
+  SEMAPHORE_EXTEND_SCRIPT,
+  SEMAPHORE_RELEASE_SCRIPT,
+  SEMAPHORE_REMAINING_TTL_SCRIPT,
+} from "./lua-scripts";
 
 export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive implements types.IDistributedSemaphore {
   public readonly maxCount: number;
+
+  private readonly permits: ILeaseOperations<types.TSemaphoreToken>;
 
   public constructor(props: types.TDistributedSemaphoreConstructorProps & {
     redisClient: RedisClientType;
@@ -49,6 +34,11 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
 
     super({ ...props, name: `${ELockDisplayType.Semaphore}:${props.name}` });
     this.maxCount = props.maxCount;
+    this.permits = {
+      release: async (token) => this.release(token),
+      extend: async (token, ttlMs) => this.extendPermit(token, ttlMs),
+      remainingTtl: async (token) => this.permitRemainingTtl(token),
+    };
   }
 
   public async waitForAnyUnlock(): Promise<void> {
@@ -83,6 +73,7 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
     }
 
     this.destroyed = true;
+    this.clearExpiryWake();
 
     await this.redisClient.del(this.name);
 
@@ -103,27 +94,29 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
   public async freeCount(): Promise<number> {
     this.ensureAlive();
 
-    await this.redisClient.zRemRangeByScore(this.name, "-inf", Date.now());
-    const currentCount = await this.redisClient.zCard(this.name);
-    return this.maxCount - currentCount;
+    const [heldCount, nextExpiryInMs] = await SEMAPHORE_COUNT_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+    }) as [number, number];
+
+    this.scheduleExpiryWake(nextExpiryInMs);
+
+    return this.maxCount - heldCount;
   }
 
-  public async acquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TSemaphoreToken>> {
+  public async acquire(params?: types.TSemaphoreAcquireParams): Promise<types.ISemaphoreReleaser> {
     this.ensureAlive();
+
+    const lockTtlMs = params?.ttlMs ?? DEFAULT_TTL_MS;
+    assertTtl(lockTtlMs);
 
     await this.ensureSubscriber();
 
     // `??` and not `||`: timeoutMs 0 means "fail fast", not "use the default".
     const timeoutMs = params?.timeoutMs ?? DEFAULT_TTL_MS;
-    // Lock member expiry must stay positive even when the wait timeout is 0.
-    const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
     const acquireToken = await this.acquireOnce(lockTtlMs);
     if (acquireToken) {
-      return new DistributedReleaser<types.TSemaphoreToken>(
-        () => this.release(acquireToken),
-        acquireToken as types.TSemaphoreToken,
-      );
+      return this.createReleaser(acquireToken);
     }
 
     if (timeoutMs === 0) {
@@ -152,7 +145,7 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
     });
   }
 
-  public async tryAcquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TSemaphoreToken> | null> {
+  public async tryAcquire(params?: types.TSemaphoreAcquireParams): Promise<types.ISemaphoreReleaser | null> {
     const timeoutMs = params?.timeoutMs ?? 0;
 
     try {
@@ -164,6 +157,12 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
 
       throw error;
     }
+  }
+
+  public restoreReleaser(token: types.TSemaphoreToken): types.ISemaphoreReleaser {
+    this.ensureAlive();
+
+    return this.createReleaser(token);
   }
 
   public async cancelAll(errMessage?: string): Promise<void> {
@@ -203,21 +202,22 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
 
   protected async acquireOnce(ttlMs: number): Promise<types.TAcquireToken | undefined> {
     const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
-    const now = Date.now();
-    const expiryTimestamp = now + ttlMs;
 
-    const result = await ACQUIRE_SCRIPT.run(this.redisClient, {
+    const [acquired, nextExpiryInMs] = await SEMAPHORE_ACQUIRE_SCRIPT.run(this.redisClient, {
       keys: [this.name],
-      arguments: [
-        now.toString(),
-        this.maxCount.toString(),
-        expiryTimestamp.toString(),
-        token,
-        (ttlMs * 3).toString(),
-      ],
-    });
+      arguments: [this.maxCount.toString(), token, ttlArgument(ttlMs)],
+    }) as [number, number?];
 
-    return result === 1 ? token : undefined;
+    if (acquired === 1) {
+      return token;
+    }
+
+    this.scheduleExpiryWake(nextExpiryInMs ?? -1);
+    return undefined;
+  }
+
+  protected createReleaser(token: types.TAcquireToken): types.ISemaphoreReleaser {
+    return new RedisLeaseReleaser(this.permits, token as types.TSemaphoreToken);
   }
 
   protected async release(token: types.TAcquireToken): Promise<void> {
@@ -225,14 +225,46 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
       return;
     }
 
-    const removed = await RELEASE_SCRIPT.run(this.redisClient, {
+    const released = await SEMAPHORE_RELEASE_SCRIPT.run(this.redisClient, {
       keys: [this.name],
       arguments: [token],
     });
 
-    if (removed === 1) {
+    if (released === 1) {
       await this.redisClient.publish(`${this.name}:release`, token);
     }
+  }
+
+  private async extendPermit(token: types.TSemaphoreToken, ttlMs: number): Promise<boolean> {
+    assertTtl(ttlMs);
+
+    if (this.destroyed) {
+      return false;
+    }
+
+    const extended = await SEMAPHORE_EXTEND_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token, ttlArgument(ttlMs)],
+    });
+
+    return extended === 1;
+  }
+
+  private async permitRemainingTtl(token: types.TSemaphoreToken): Promise<number | null> {
+    if (this.destroyed) {
+      return null;
+    }
+
+    const remaining = await SEMAPHORE_REMAINING_TTL_SCRIPT.run(this.redisClient, {
+      keys: [this.name],
+      arguments: [token],
+    }) as number;
+
+    if (remaining === -2) {
+      return null;
+    }
+
+    return remaining === -1 ? Infinity : remaining;
   }
 
   private ensureAlive(): void {

@@ -252,7 +252,7 @@ describe("RedisDistributedMutex", () => {
   it("should allow acquisition by another instance after the lock expires naturally in Redis", async () => {
     const [mutex1, mutex2] = peerMutexes();
 
-    const releaser = await mutex1.acquire({ timeoutMs: 500 });
+    const releaser = await mutex1.acquire({ ttlMs: 500 });
 
     await sleep(1000);
 
