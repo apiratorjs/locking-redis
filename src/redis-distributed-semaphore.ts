@@ -118,7 +118,7 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
     // Lock member expiry must stay positive even when the wait timeout is 0.
     const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
-    const acquireToken = await this.tryAcquire(lockTtlMs);
+    const acquireToken = await this.acquireOnce(lockTtlMs);
     if (acquireToken) {
       return new DistributedReleaser<types.TSemaphoreToken>(
         () => this.release(acquireToken),
@@ -150,6 +150,20 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
 
       this.queue.push(deferred);
     });
+  }
+
+  public async tryAcquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TSemaphoreToken> | null> {
+    const timeoutMs = params?.timeoutMs ?? 0;
+
+    try {
+      return await this.acquire({ ...params, timeoutMs });
+    } catch (error) {
+      if (error instanceof TimeoutLockingError) {
+        return null;
+      }
+
+      throw error;
+    }
   }
 
   public async cancelAll(errMessage?: string): Promise<void> {
@@ -187,7 +201,7 @@ export class RedisDistributedSemaphore extends BaseDistributedLockPrimitive impl
     }
   }
 
-  protected async tryAcquire(ttlMs: number): Promise<types.TAcquireToken | undefined> {
+  protected async acquireOnce(ttlMs: number): Promise<types.TAcquireToken | undefined> {
     const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
     const now = Date.now();
     const expiryTimestamp = now + ttlMs;

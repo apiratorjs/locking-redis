@@ -2,6 +2,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import * as assert from "node:assert";
 import {
   CancelledLockingError,
+  LockNotFoundError,
   TimeoutLockingError,
   types,
 } from "@apiratorjs/locking";
@@ -430,5 +431,63 @@ describe("RedisDistributedSemaphore", () => {
       await Promise.all([releaser.release(), s.destroy()]);
       await unlockPromise;
     }
+  });
+
+  describe("tryAcquire", () => {
+    it("should acquire free permits and return null when none are left", async () => {
+      const s = semaphore(2);
+
+      const r1 = await s.tryAcquire();
+      const r2 = await s.tryAcquire();
+      assert.ok(r1);
+      assert.ok(r2);
+      assert.strictEqual(await s.freeCount(), 0);
+
+      const start = Date.now();
+      assert.strictEqual(await s.tryAcquire(), null);
+      assert.ok(Date.now() - start < 500, "tryAcquire should not wait by default");
+
+      await r1.release();
+      assert.strictEqual(await s.freeCount(), 1);
+      await r2.release();
+    });
+
+    it("should wait up to timeoutMs and acquire once a permit is released", async () => {
+      const s = semaphore(1);
+      const held = await s.acquire();
+
+      const tryPromise = s.tryAcquire({ timeoutMs: 2000 });
+      await sleep(200);
+      await held.release();
+
+      const releaser = await tryPromise;
+      assert.ok(releaser);
+      await releaser.release();
+    });
+
+    it("should return null when timeoutMs elapses", async () => {
+      const s = semaphore(1);
+      await s.acquire();
+
+      assert.strictEqual(await s.tryAcquire({ timeoutMs: 200 }), null);
+    });
+
+    it("should still throw on cancellation", async () => {
+      const s = semaphore(1);
+      await s.acquire();
+
+      const rejection = assert.rejects(s.tryAcquire({ timeoutMs: 5000 }), CancelledLockingError);
+      await sleep(100);
+      await s.cancelAll();
+
+      await rejection;
+    });
+
+    it("should throw LockNotFoundError on a destroyed semaphore", async () => {
+      const s = semaphore(1);
+      await s.destroy();
+
+      await assert.rejects(s.tryAcquire(), LockNotFoundError);
+    });
   });
 });

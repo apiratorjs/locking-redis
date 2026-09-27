@@ -65,7 +65,7 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     // Redis PX must be positive; a zero wait timeout still needs a real lock TTL.
     const lockTtlMs = timeoutMs > 0 ? timeoutMs : DEFAULT_TTL_MS;
 
-    const acquireToken = await this.tryAcquire(lockTtlMs);
+    const acquireToken = await this.acquireOnce(lockTtlMs);
     if (acquireToken) {
       return new DistributedReleaser<types.TMutexToken>(
         () => this.release(acquireToken),
@@ -97,6 +97,20 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
 
       this.queue.push(deferred);
     });
+  }
+
+  public async tryAcquire(params?: types.TAcquireParams): Promise<types.IReleaser<types.TMutexToken> | null> {
+    const timeoutMs = params?.timeoutMs ?? 0;
+
+    try {
+      return await this.acquire({ ...params, timeoutMs });
+    } catch (error) {
+      if (error instanceof TimeoutLockingError) {
+        return null;
+      }
+
+      throw error;
+    }
   }
 
   public async cancel(errMessage?: string): Promise<void> {
@@ -148,7 +162,7 @@ export class RedisDistributedMutex extends BaseDistributedLockPrimitive implemen
     });
   }
 
-  protected async tryAcquire(timeoutMs: number): Promise<types.TAcquireToken | undefined> {
+  protected async acquireOnce(timeoutMs: number): Promise<types.TAcquireToken | undefined> {
     const token = `${this.name}:${crypto.randomUUID()}` as types.TAcquireToken;
 
     const result = await this.redisClient.set(this.name, token, {

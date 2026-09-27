@@ -6,7 +6,7 @@
 An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/locking) library, providing a Redis-backed
 `IDistributedLockManager` with distributed mutexes and semaphores for true cross-process concurrency control in Node.js.
 
-> **Note:** Requires Node.js version **>=16.4.0**, [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^5.0.0**,
+> **Note:** Requires Node.js version **>=16.4.0**, [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^6.0.0**,
 > and a running Redis instance (version 5+ recommended).
 >
 > Upgrading from 1.x? See [CHANGELOG](./CHANGELOG.md) and [2.0.0 release notes](./RELEASE_NOTES.md).
@@ -32,6 +32,7 @@ An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/loc
 - **Time-limited locks (TTL)** — prevents deadlocks if processes crash without releasing.
 - **Cancellation, timeouts, and FIFO waiters** — cancel blocked acquisitions, fail fast with `timeoutMs: 0`, queue
   waiters in order.
+- **Non-throwing `tryAcquire()`** — returns a releaser, or `null` when the lock is busy (no wait by default).
 - **Read-write locks** — not implemented yet; `readWriteLock()` throws `LockingError`.
 
 ---
@@ -122,6 +123,16 @@ await mutex.runExclusive(async () => {
   // Acquired and released automatically
 });
 
+// Returns null instead of throwing when the mutex is busy; doesn't wait unless timeoutMs is given
+const maybeReleaser = await mutex.tryAcquire();
+if (maybeReleaser) {
+  try {
+    // Critical section
+  } finally {
+    await maybeReleaser.release();
+  }
+}
+
 await mutex.cancel("Operation cancelled");
 await mutex.waitForUnlock();
 ```
@@ -141,6 +152,9 @@ try {
 await semaphore.runExclusive(async () => {
   // Acquired and released automatically
 });
+
+const maybePermit = await semaphore.tryAcquire({ timeoutMs: 1000 }); // null if no permit within 1s
+await maybePermit?.release();
 
 await semaphore.cancelAll("Operation cancelled");
 await semaphore.waitForAnyUnlock();
@@ -197,7 +211,7 @@ Errors come from `@apiratorjs/locking`:
 
 | Error Class | When thrown |
 |-------------|-------------|
-| `TimeoutLockingError` | `acquire()` exceeds `timeoutMs` |
+| `TimeoutLockingError` | `acquire()` exceeds `timeoutMs` (`tryAcquire()` returns `null` instead) |
 | `CancelledLockingError` | `cancel()` / `cancelAll()` or destroy |
 | `LockNotFoundError` | Lock was destroyed |
 | `LockConfigMismatchError` | Same name requested with conflicting `maxCount` |

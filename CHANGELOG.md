@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-27
+
+Compared to **2.0.0**. Requires [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^6.0.0**.
+
+### Breaking Changes
+
+- Peer dependency `@apiratorjs/locking` bumped from **^5.0.0** to **^6.0.0**. Locking 6 adds required `tryAcquire()` methods to `IMutex` / `ISemaphore` (and therefore to `IDistributedMutex` / `IDistributedSemaphore`), so this package no longer works with locking 5.x.
+- `BaseDistributedLockPrimitive`: the protected abstract `tryAcquire(ttlMs)` is renamed to `acquireOnce(ttlMs)` to free the name for the public interface method. Only affects code that subclasses `RedisDistributedMutex`, `RedisDistributedSemaphore`, or the base class and overrides / calls that method.
+
+### Added
+
+- `tryAcquire(params?)` on `RedisDistributedMutex` and `RedisDistributedSemaphore`. Resolves to a releaser, or to `null` when the lock could not be acquired within `timeoutMs`, instead of throwing `TimeoutLockingError`.
+
+```typescript
+const releaser = await locks.mutex("orders").tryAcquire();
+if (!releaser) {
+  return; // lock is busy
+}
+
+try {
+  // ... critical section ...
+} finally {
+  await releaser.release();
+}
+```
+
+### Behavior (aligned with locking 6.x)
+
+- `timeoutMs` defaults to `0` for `tryAcquire()` (the `acquire()` default stays at 1 minute): a busy lock yields `null` right away. Pass `timeoutMs` to wait a bounded time first.
+- Only a timeout becomes `null`. Cancellation (`CancelledLockingError`) and destroyed locks (`LockNotFoundError`) still throw.
+- With `timeoutMs: 0` the check and the acquisition are one atomic Redis operation (`SET NX` for the mutex, the acquire Lua script for the semaphore); a failed attempt leaves nothing queued.
+- `tryAcquire()` grants the lock under exactly the same conditions as `acquire()`.
+- Distributed read-write locks are still not supported (`readWriteLock()` throws), so there are no `tryAcquireRead()` / `tryAcquireWrite()` yet.
+
+### Migration checklist
+
+1. Upgrade `@apiratorjs/locking` to **^6.0.0** alongside `@apiratorjs/locking-redis` **^3.0.0**.
+2. If you subclass the Redis primitives and override or call the protected `tryAcquire(ttlMs)`, rename it to `acquireOnce(ttlMs)`.
+3. Optionally replace `try { await lock.acquire({ timeoutMs: 0 }) } catch (TimeoutLockingError)` patterns with `await lock.tryAcquire()`.
+
 ## [2.0.0] - 2026-07-26
 
 Compared to **1.0.x** (`1.0.5`). Requires [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^5.0.0**.
@@ -94,5 +134,6 @@ These match the core package contract; Redis 1.x already only cancelled the acqu
 
 See Git history and npm for 1.0.x patch notes. This changelog starts detailed entries at 2.0.0.
 
+[3.0.0]: https://github.com/apiratorjs/locking-redis/releases/tag/v3.0.0
 [2.0.0]: https://github.com/apiratorjs/locking-redis/releases/tag/v2.0.0
 [1.0.5]: https://github.com/apiratorjs/locking-redis/releases/tag/v1.0.5

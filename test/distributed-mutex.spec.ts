@@ -2,6 +2,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import * as assert from "node:assert";
 import {
   CancelledLockingError,
+  LockNotFoundError,
   TimeoutLockingError,
   types,
 } from "@apiratorjs/locking";
@@ -497,5 +498,74 @@ describe("RedisDistributedMutex", () => {
 
     await releaser.release();
     await unlockPromise;
+  });
+
+  describe("tryAcquire", () => {
+    it("should acquire a free mutex and return a working releaser", async () => {
+      const m = mutex();
+
+      const releaser = await m.tryAcquire();
+      assert.ok(releaser);
+      assert.strictEqual(await m.isLocked(), true);
+
+      await releaser.release();
+      assert.strictEqual(await m.isLocked(), false);
+    });
+
+    it("should return null right away when the mutex is locked", async () => {
+      const [a, b] = peerMutexes();
+
+      try {
+        const held = await a.acquire();
+
+        const start = Date.now();
+        const releaser = await b.tryAcquire();
+        assert.strictEqual(releaser, null);
+        assert.ok(Date.now() - start < 500, "tryAcquire should not wait by default");
+
+        await held.release();
+      } finally {
+        await a.destroy();
+        await b.destroy();
+      }
+    });
+
+    it("should wait up to timeoutMs and acquire once the mutex is released", async () => {
+      const m = mutex();
+      const held = await m.acquire();
+
+      const tryPromise = m.tryAcquire({ timeoutMs: 2000 });
+      await sleep(200);
+      await held.release();
+
+      const releaser = await tryPromise;
+      assert.ok(releaser);
+      await releaser.release();
+    });
+
+    it("should return null when timeoutMs elapses", async () => {
+      const m = mutex();
+      await m.acquire();
+
+      assert.strictEqual(await m.tryAcquire({ timeoutMs: 200 }), null);
+    });
+
+    it("should still throw on cancellation", async () => {
+      const m = mutex();
+      await m.acquire();
+
+      const rejection = assert.rejects(m.tryAcquire({ timeoutMs: 5000 }), CancelledLockingError);
+      await sleep(100);
+      await m.cancel();
+
+      await rejection;
+    });
+
+    it("should throw LockNotFoundError on a destroyed mutex", async () => {
+      const m = mutex();
+      await m.destroy();
+
+      await assert.rejects(m.tryAcquire(), LockNotFoundError);
+    });
   });
 });

@@ -53,7 +53,7 @@ export abstract class BaseDistributedLockPrimitive {
     await this.redisSubscriber.subscribe(`${this.name}:release`, async () => {
       while (this.queue.length > 0) {
         const nextInQueue = this.queue.shift() as IDistributedDeferred;
-        const acquireToken = await this.tryAcquire(nextInQueue.ttlMs);
+        const acquireToken = await this.acquireOnce(nextInQueue.ttlMs);
         if (!acquireToken) {
           this.queue.unshift(nextInQueue);
           break;
@@ -180,7 +180,7 @@ export abstract class BaseDistributedLockPrimitive {
     }
   }
 
-  protected abstract tryAcquire(ttlMs: number): Promise<types.TAcquireToken | undefined>;
+  protected abstract acquireOnce(ttlMs: number): Promise<types.TAcquireToken | undefined>;
 
   protected abstract destroy(): Promise<void>;
 

@@ -1,32 +1,38 @@
-# Release notes — @apiratorjs/locking-redis 2.0.0
+# Release notes — @apiratorjs/locking-redis 3.0.0
 
-Major rewrite to match [@apiratorjs/locking](https://github.com/apiratorjs/locking) **5.0.0**. Redis locks are no longer plugged in via static `.factory` hooks; you construct a `RedisDistributedLockManager` and create named mutexes / semaphores from it.
+Follows [@apiratorjs/locking](https://github.com/apiratorjs/locking) **6.0.0**, which adds non-throwing `tryAcquire()` to the mutex and semaphore contracts. Redis mutexes and semaphores now implement it.
 
 ## Highlights
 
-- **`RedisDistributedLockManager`** replaces `createRedisLockFactory` / `IRedisLockFactory`.
-- Implements **`IDistributedLockManager`**: same contract as `InMemoryDistributedLockManager` in the core package.
-- **`timeoutMs: 0`** fails immediately with `TimeoutLockingError` when the lock is busy (lock TTL still uses a positive default).
-- Idempotent **`release()`**; unlock waiters no longer use a separate Redis subscription that could break the acquire queue.
-- Peer dependency: **`@apiratorjs/locking` ^5.0.0**.
+- **`tryAcquire(params?)`** on `RedisDistributedMutex` and `RedisDistributedSemaphore`: returns a releaser, or `null` when the lock is busy.
+- **No waiting by default**: `timeoutMs` defaults to `0` for `tryAcquire()`; pass `timeoutMs` to wait a bounded time. `acquire()` keeps its 1-minute default.
+- **Only a timeout becomes `null`**: cancellation (`CancelledLockingError`) and destroyed locks (`LockNotFoundError`) still throw.
+- **Atomic fast path**: with `timeoutMs: 0` the check and acquisition are one Redis operation (`SET NX` / Lua script), not `isLocked()` + `acquire()`.
+- Peer dependency: **`@apiratorjs/locking` ^6.0.0** (breaking: 5.x is no longer supported).
+- Protected `tryAcquire(ttlMs)` in `BaseDistributedLockPrimitive` renamed to `acquireOnce(ttlMs)` (affects subclasses only).
 - Distributed read-write locks are still not supported (`readWriteLock()` throws).
 
 ## Upgrade in one glance
 
+```bash
+npm install @apiratorjs/locking@^6 @apiratorjs/locking-redis@^3
+```
+
 ```typescript
-// 1.x
-import { DistributedMutex } from "@apiratorjs/locking";
-import { createRedisLockFactory } from "@apiratorjs/locking-redis";
-
-const lockFactory = await createRedisLockFactory({ url: "redis://localhost:6379" });
-DistributedMutex.factory = lockFactory.createDistributedMutex;
-const mutex = new DistributedMutex({ name: "orders" });
-
 // 2.x
-import { RedisDistributedLockManager } from "@apiratorjs/locking-redis";
+try {
+  const releaser = await mutex.acquire({ timeoutMs: 0 });
+  // ...
+} catch (error) {
+  if (!(error instanceof TimeoutLockingError)) throw error;
+  // busy
+}
 
-const locks = await RedisDistributedLockManager.create({ url: "redis://localhost:6379" });
-const mutex = locks.mutex("orders");
+// 3.x
+const releaser = await mutex.tryAcquire();
+if (releaser) {
+  // ...
+}
 ```
 
 Full migration notes and behavior details: [CHANGELOG.md](./CHANGELOG.md).
