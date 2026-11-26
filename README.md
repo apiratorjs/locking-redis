@@ -6,7 +6,7 @@
 An extension to the core [@apiratorjs/locking](https://github.com/apiratorjs/locking) library, providing a Redis-backed
 `IDistributedLockManager` with distributed mutexes and semaphores for true cross-process concurrency control in Node.js.
 
-> **Note:** Requires Node.js version **>=16.4.0**, [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^8.0.0**,
+> **Note:** Requires Node.js version **>=16.4.0** (**>=17.2.0** with locking 9), [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^8.0.0 or ^9.0.0**,
 > and a running Redis instance, version 5 or newer.
 >
 > Upgrading from 3.x? See [CHANGELOG](./CHANGELOG.md) and [4.0.0 release notes](./RELEASE_NOTES.md).

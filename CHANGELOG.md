@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1] - 2026-11-26
+
+Compared to **4.0.0**.
+
+### Changed
+
+- Peer dependency `@apiratorjs/locking` widened from **^8.0.0** to **^8.0.0 || ^9.0.0**. Locking 9 only raises its minimum Node.js to 17.2.0 and adds `LeaseKeeper`, which works with the releasers of this package as they are. No code changes.
+
 ## [4.0.0] - 2026-09-27
 
 Compared to **3.0.0**. Requires [@apiratorjs/locking](https://github.com/apiratorjs/locking) **^8.0.0** and Redis **5+**.
